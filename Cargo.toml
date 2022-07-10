@@ -1,0 +1,15 @@
+[package]
+name = "discord-bot"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+serenity = { version = "^0.10.2", features = ["builder", "cache", "client", "framework", "gateway", "http", "model", "standard_framework", "utils", "rustls_backend", "voice"] }
+tokio = { version = "1.19.2", features = ["full"] }
+log = "0.4.17"
+log4rs = "1.1.1"
+songbird = { version = "0.2.2", features = ["default"] }
+lazy_static = "1.4.0"
+parking_lot = "0.12.1"

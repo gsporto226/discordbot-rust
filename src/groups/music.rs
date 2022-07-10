@@ -1,37 +1,40 @@
-use std::{collections::HashMap, sync::Arc};
-
-use log::{debug, warn};
+use super::{DiscordCommandError, GuildMusicResult};
+use crate::{utils::ArcMut, SONGBIRD};
+use log::debug;
+use parking_lot::Mutex;
 use serenity::{
     async_trait,
     client::Context,
     framework::standard::{
-        buckets::RevertBucket,
-        macros::{check, command, group},
-        Args, CommandError, CommandOptions, CommandResult, Reason,
+        macros::{command, group},
+        Args, CommandResult
     },
     model::{
         channel::Message,
-        guild,
         id::{ChannelId, GuildId, UserId},
     },
-    prelude::{Mutex, TypeMapKey},
+    prelude::{Mutex as AsyncMutex, TypeMapKey},
 };
 use songbird::{
     create_player,
     input::Restartable,
     tracks::{Track, TrackHandle},
-    Call, Event, EventContext, EventHandler as VoiceEventHandler, Songbird, SongbirdKey,
+    Call, Event, EventContext, EventHandler as VoiceEventHandler,
     TrackEvent,
 };
-
-use crate::SONGBIRD;
-
-use super::DiscordCommandError;
+use std::{collections::HashMap, sync::Arc};
 
 struct GuildMusicHashMapKey;
+type TrackPair = (Track, TrackHandle);
+type GuildMusicHashmap = HashMap<GuildId, Arc<GuildMusic>>;
 
 impl TypeMapKey for GuildMusicHashMapKey {
-    type Value = HashMap<GuildId, Arc<Mutex<GuildMusicData>>>;
+    type Value = ArcMut<GuildMusicHashmap>;
+}
+
+lazy_static! {
+    static ref GUILD_MUSIC_HASHMAP: ArcMut<GuildMusicHashmap> =
+        Arc::new(Mutex::new(HashMap::new()));
 }
 
 #[derive(Debug)]
@@ -42,12 +45,164 @@ struct MusicQueueEntry {
 }
 
 #[derive(Debug)]
-pub(crate) struct GuildMusicData {
+pub struct GuildMusicData {
     guild_id: GuildId,
     queue: Vec<MusicQueueEntry>,
-    preloaded: HashMap<String, (Track, TrackHandle)>,
+    preloaded: HashMap<String, TrackPair>,
     now_playing: Option<TrackHandle>,
-    call_pair: Option<(ChannelId, Arc<Mutex<Call>>)>,
+    call_pair: Option<(ChannelId, Arc<AsyncMutex<Call>>)>,
+}
+
+#[allow(clippy::module_name_repetitions)]
+pub struct GuildMusic {
+    pub guild_music_data: Arc<Mutex<GuildMusicData>>,
+}
+
+async fn get_ytdl_track(url: String) -> Option<TrackPair> {
+    match Restartable::ytdl(url, false).await {
+        Ok(restartable) => Some(create_player(restartable.into())),
+        Err(_error) => None,
+    }
+}
+
+async fn get_call(guild_id: GuildId, channel_id: ChannelId) -> Option<Arc<AsyncMutex<Call>>> {
+    let (call_lock, result) = SONGBIRD.join(guild_id, channel_id).await;
+    if let Ok(_channel) = result {
+        Some(call_lock)
+    } else {
+        None
+    }
+}
+
+impl GuildMusic {
+    pub fn new(guild_id: GuildId) -> Self {
+        Self {
+            guild_music_data: Arc::new(Mutex::new(GuildMusicData::new(guild_id))),
+        }
+    }
+
+    fn tick_guild_music(&self) {
+        if let Some((guild_id, next, track_pair_option, current_call_option)) = {
+            let mut guild_music_data = self.guild_music_data.lock();
+            if guild_music_data.now_playing.is_none() {
+                debug!(
+                    "Now playing is none, getting next for guild {:?}",
+                    guild_music_data.guild_id
+                );
+                if let Some(next) = guild_music_data.queue.pop() {
+                    debug!("Will try to play {:?}", next);
+                    let track_pair = {
+                        if let Some((_url, result)) =
+                            guild_music_data.preloaded.remove_entry(&next.url)
+                        {
+                            Some(result)
+                        } else {
+                            None
+                        }
+                    };
+                    let current_call = {
+                        if let Some((channel_id, current_call_lock)) = &guild_music_data.call_pair {
+                            if channel_id.0 == next.channel_id.0 {
+                                Some(current_call_lock.clone())
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
+                        }
+                    };
+                    Some((guild_music_data.guild_id, next, track_pair, current_call))
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        } {
+            let guild_music_data_lock = self.guild_music_data.clone();
+            tokio::spawn(async move {
+                match {
+                    if track_pair_option.is_some() {
+                        track_pair_option
+                    } else {
+                        get_ytdl_track(next.url).await
+                    }
+                } {
+                    Some((track, handle)) => {
+                        match {
+                            if current_call_option.is_some() {
+                                current_call_option
+                            } else {
+                                get_call(guild_id, next.channel_id).await
+                            }
+                        } {
+                            Some(call_lock) => {
+                                {
+                                    guild_music_data_lock.lock().now_playing = Some(handle);
+                                }
+                                let mut call = call_lock.lock().await;
+                                debug!("Acquired call lock");
+                                call.play(track);
+                                call.remove_all_global_events();
+                                call.add_global_event(
+                                    Event::Track(TrackEvent::End),
+                                    TrackEventListener { guild_id },
+                                );
+                            }
+                            None => {
+                                // reply with failure to get voice channel
+                            }
+                        };
+                    }
+                    None => {
+                        // reply with failure
+                    }
+                }
+            });
+        };
+    }
+
+    pub fn insert_music(&self, url: String, channel_id: ChannelId, requested_by: UserId) {
+        {
+            let mut guild_music_data = self.guild_music_data.lock();
+            guild_music_data.queue.push(MusicQueueEntry {
+                url,
+                channel_id,
+                requested_by,
+            });
+            debug!("Inserted music into guild {:?}", guild_music_data.guild_id);
+        }
+        self.tick_guild_music();
+    }
+
+    pub fn handle_track_event(&self, _ctx: &EventContext<'_>) {
+        {
+            let mut guild_music_data = self.guild_music_data.lock();
+            guild_music_data.now_playing = None;
+        }
+        self.tick_guild_music();
+    }
+
+    pub fn skip(&self) -> GuildMusicResult<()> {
+        let guild_music_data = self.guild_music_data.lock();
+        if let Some(now_playing) = &guild_music_data.now_playing {
+            if let Err(why) = now_playing.stop() {
+                Err( DiscordCommandError {
+                    kind: super::ErrorKind::InternalError,
+                    source: Some(Box::new(why)),
+                    severity: super::ErrorSeverity::Internal
+                })
+            } else {
+                Ok(())
+            }
+        } else {
+            Err( DiscordCommandError { 
+                kind: super::ErrorKind::NoSongCurrentlyPlaying,
+                source: None,
+                severity: super::ErrorSeverity::UserInput
+            })
+        }
+    }
 }
 
 impl GuildMusicData {
@@ -68,27 +223,34 @@ impl GuildMusicData {
 #[commands(play, skip)]
 pub struct Music;
 
-async fn get_guild_music_data(
-    context: &Context,
+fn queue_is_not_empty(guild_music_data: GuildMusicData) -> bool {
+    todo!();
+}
+
+struct TrackEventListener {
     guild_id: GuildId,
-) -> Arc<Mutex<GuildMusicData>> {
-    let mut data = context.data.write().await;
-    let guild_data = GuildMusicData::new(guild_id);
-    match data.get_mut::<GuildMusicHashMapKey>() {
-        Some(hashmap) => {
-            let guild_music_data = hashmap
-                .entry(guild_id)
-                .or_insert(Arc::new(Mutex::new(guild_data)));
-            guild_music_data.clone()
-        }
-        None => {
-            let mut map: HashMap<GuildId, Arc<Mutex<GuildMusicData>>> = HashMap::new();
-            let guild_music_data = Arc::new(Mutex::new(guild_data));
-            map.insert(guild_id, guild_music_data.clone());
-            data.insert::<GuildMusicHashMapKey>(map);
-            guild_music_data
-        }
+}
+
+#[async_trait]
+impl VoiceEventHandler for TrackEventListener {
+    async fn act(&self, ctx: &EventContext<'_>) -> Option<Event> {
+        if let Some(guild_music) = GUILD_MUSIC_HASHMAP.lock().get(&self.guild_id) {
+            guild_music.handle_track_event(ctx);
+        };
+        None
     }
+}
+
+async fn get_guild_music_for(context: &Context, guild_id: GuildId) -> Arc<GuildMusic> {
+    let mut data = context.data.write().await;
+    let mut guild_music_hashmap = GUILD_MUSIC_HASHMAP.lock();
+    let guild_music = guild_music_hashmap
+        .entry(guild_id)
+        .or_insert_with(|| Arc::new(GuildMusic::new(guild_id)));
+    if !data.contains_key::<GuildMusicHashMapKey>() {
+        data.insert::<GuildMusicHashMapKey>(GUILD_MUSIC_HASHMAP.clone());
+    };
+    guild_music.clone()
 }
 
 async fn get_voice_guild_and_channel(
@@ -108,110 +270,18 @@ async fn get_voice_guild_and_channel(
     None
 }
 
-fn queue_is_not_empty(guild_music_data: GuildMusicData) -> bool {
-    todo!();
-}
-
-async fn get_ytdl_track(url: String) -> Option<(Track, TrackHandle)> {
-    match Restartable::ytdl(url, false).await {
-        Ok(restartable) => Some(create_player(restartable.into())),
-        Err(_error) => None,
-    }
-}
-
-struct TrackEndListener {
-    guild_music_data_lock: Arc<Mutex<GuildMusicData>>,
-}
-
-#[async_trait]
-impl VoiceEventHandler for TrackEndListener {
-    async fn act(&self, _ctx: &EventContext<'_>) -> Option<Event> {
-        {
-            let mut guild_music_data = self.guild_music_data_lock.lock().await;
-            guild_music_data.now_playing = None;
-        }
-        tick_guild_music(self.guild_music_data_lock.clone()).await;
-        None
-    }
-}
-
-async fn get_call(guild_id: GuildId, channel_id: ChannelId) -> Option<Arc<Mutex<Call>>> {
-    let (call_lock, result) = SONGBIRD.join(guild_id, channel_id).await;
-    if let Ok(_channel) = result {
-        Some(call_lock)
-    } else {
-        None
-    }
-}
-
-async fn tick_guild_music(guild_music_data_lock: Arc<Mutex<GuildMusicData>>) {
-    let mut guild_music_data = guild_music_data_lock.lock().await;
-    if guild_music_data.now_playing.is_none() {
-        debug!("Now playing is none, getting next for guild {:?}", guild_music_data.guild_id);
-        if let Some(next) = guild_music_data.queue.pop() {
-            debug!("Will try to play {:?}", next);
-            if let Some((track, handle)) = {
-                if let Some((_url, result)) = guild_music_data.preloaded.remove_entry(&next.url) {
-                    Some(result)
-                } else {
-                    get_ytdl_track(next.url).await
-                }
-            } {
-                debug!("Found track and handle");
-                if let Some(call_lock) = {
-                    if let Some((channel_id, current_call_lock)) = &guild_music_data.call_pair {
-                        if channel_id.0 == next.channel_id.0 {
-                            Some(current_call_lock.clone())
-                        } else {
-                            get_call(guild_music_data.guild_id, next.channel_id).await
-                        }
-                    } else {
-                        get_call(guild_music_data.guild_id, next.channel_id).await
-                    }
-                } {
-                    let mut call = call_lock.lock().await;
-                    debug!("Acquired call lock");
-                    guild_music_data.now_playing = Some(handle);
-                    call.play(track);
-                    call.remove_all_global_events();
-                    call.add_global_event(
-                        Event::Track(TrackEvent::End),
-                        TrackEndListener {
-                            guild_music_data_lock: guild_music_data_lock.clone(),
-                        },
-                    );
-                }
-            }
-        }
-    }
-}
-
-async fn insert_music_into(
-    guild_music_data_lock: Arc<Mutex<GuildMusicData>>,
-    url: String,
-    channel_id: ChannelId,
-    requested_by: UserId,
-) {
-    {
-        let mut guild_music_data = guild_music_data_lock.lock().await;
-        guild_music_data.queue.push(MusicQueueEntry {
-            url,
-            channel_id,
-            requested_by,
-        });
-        debug!("Inserted music into guild {:?}", guild_music_data.guild_id);
-    }
-    tick_guild_music(guild_music_data_lock.clone()).await;
-}
-
 #[command]
 #[aliases("p", "ply")]
 async fn play(context: &Context, message: &Message, mut args: Args) -> CommandResult {
-    let user_id = message.author.id;
+    let requested_by = message.author.id;
     match get_voice_guild_and_channel(context, message).await {
         Some((guild_id, channel_id)) => {
             if let Ok(url) = args.single::<String>() {
-                insert_music_into(get_guild_music_data(context, guild_id).await, url, channel_id, user_id).await;
+                get_guild_music_for(context, guild_id).await.insert_music(
+                    url,
+                    channel_id,
+                    requested_by,
+                );
                 Ok(())
             } else {
                 Err(DiscordCommandError {
@@ -244,19 +314,18 @@ async fn play(context: &Context, message: &Message, mut args: Args) -> CommandRe
 #[aliases("s", "skp")]
 async fn skip(context: &Context, message: &Message, mut _args: Args) -> CommandResult {
     if let Some(guild_id) = message.guild_id {
-        let guild_music_data_lock = get_guild_music_data(context, guild_id).await;
-        let guild_music_data = guild_music_data_lock.lock().await;
-        if let Some(now_playing) = &guild_music_data.now_playing {
-            if let Err(why) = now_playing.stop() {
-                Err(DiscordCommandError { source: Some(Box::new(why)), severity: super::ErrorSeverity::Internal, kind: super::ErrorKind::InternalError }.into())
-            } else {
-                Ok(())
-            }
+        if let Err(err) = get_guild_music_for(context, guild_id).await.skip() {
+            Err(err.into())
         } else {
-            Err(DiscordCommandError { source: None, severity: super::ErrorSeverity::UserInput, kind: super::ErrorKind::NoSongCurrentlyPlaying }.into())
+            Ok(())
         }
     } else {
-        Err(DiscordCommandError { source: None, severity: super::ErrorSeverity::UserInput, kind: super::ErrorKind::MessageNotInGuildChannel }.into())
+        Err(DiscordCommandError {
+            source: None,
+            severity: super::ErrorSeverity::UserInput,
+            kind: super::ErrorKind::MessageNotInGuildChannel,
+        }
+        .into())
     }
 }
 // #[command]

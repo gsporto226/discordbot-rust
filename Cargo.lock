@@ -283,6 +283,7 @@ dependencies = [
  "lazy_static",
  "log",
  "log4rs",
+ "parking_lot 0.12.1",
  "serenity",
  "songbird",
  "tokio",

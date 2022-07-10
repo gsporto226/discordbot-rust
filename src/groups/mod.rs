@@ -16,6 +16,8 @@ pub enum ErrorKind {
     NoSongCurrentlyPlaying
 }
 
+pub type GuildMusicResult<T> = Result<T, DiscordCommandError>;
+
 #[derive(Debug)]
 pub struct DiscordCommandError {
     pub kind: ErrorKind,

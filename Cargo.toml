@@ -12,3 +12,4 @@ log = "0.4.17"
 log4rs = "1.1.1"
 songbird = { version = "0.2.2", features = ["default"] }
 lazy_static = "1.4.0"
+parking_lot = "0.12.1"

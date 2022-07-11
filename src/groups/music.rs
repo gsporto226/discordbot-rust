@@ -11,7 +11,7 @@ use serenity::{
     },
     model::{
         channel::Message,
-        id::{ChannelId, GuildId, UserId},
+        id::{ChannelId, GuildId, UserId}, guild,
     },
     prelude::{Mutex as AsyncMutex, TypeMapKey},
 };
@@ -22,7 +22,8 @@ use songbird::{
     Call, Event, EventContext, EventHandler as VoiceEventHandler,
     TrackEvent,
 };
-use std::{collections::HashMap, sync::Arc};
+use uuid::Uuid;
+use std::{collections::HashMap, sync::Arc, time::Instant};
 
 struct GuildMusicHashMapKey;
 type TrackPair = (Track, TrackHandle);
@@ -38,18 +39,31 @@ lazy_static! {
 }
 
 #[derive(Debug)]
-struct MusicQueueEntry {
+struct MusicRequest {
+    uuid: uuid::Uuid,
     url: String,
     channel_id: ChannelId,
-    requested_by: UserId,
+    _requested_by: UserId
+}
+
+#[derive(Debug)]
+struct LoadedMusic {
+    uuid: Uuid,
+    track_pair: Option<TrackPair>
+}
+
+#[derive(Debug)]
+struct NowPlaying {
+    uuid: Uuid,
+    track_handle: TrackHandle
 }
 
 #[derive(Debug)]
 pub struct GuildMusicData {
     guild_id: GuildId,
-    queue: Vec<MusicQueueEntry>,
-    preloaded: HashMap<String, TrackPair>,
-    now_playing: Option<TrackHandle>,
+    queue: Vec<MusicRequest>,
+    preloaded: Option<LoadedMusic>,
+    now_playing: Option<NowPlaying>,
     call_pair: Option<(ChannelId, Arc<AsyncMutex<Call>>)>,
 }
 
@@ -82,35 +96,27 @@ impl GuildMusic {
     }
 
     fn tick_guild_music(&self) {
+        let mut guild_music_data = self.guild_music_data.lock();
         if let Some((guild_id, next, track_pair_option, current_call_option)) = {
-            let mut guild_music_data = self.guild_music_data.lock();
             if guild_music_data.now_playing.is_none() {
-                debug!(
-                    "Now playing is none, getting next for guild {:?}",
-                    guild_music_data.guild_id
-                );
                 if let Some(next) = guild_music_data.queue.pop() {
-                    debug!("Will try to play {:?}", next);
-                    let track_pair = {
-                        if let Some((_url, result)) =
-                            guild_music_data.preloaded.remove_entry(&next.url)
-                        {
-                            Some(result)
-                        } else {
-                            None
-                        }
-                    };
-                    let current_call = {
-                        if let Some((channel_id, current_call_lock)) = &guild_music_data.call_pair {
-                            if channel_id.0 == next.channel_id.0 {
-                                Some(current_call_lock.clone())
+                    debug!("Next is {:?}", next);
+                    let track_pair = guild_music_data.preloaded.take().and_then(|preloaded| {
+                        preloaded.track_pair.and_then(|track_pair| {
+                            if preloaded.uuid == next.uuid {
+                                Some(track_pair)
                             } else {
                                 None
                             }
+                        })
+                    });
+                    let current_call = guild_music_data.call_pair.as_ref().and_then(|(channel_id, current_call_lock)| {
+                        if channel_id.0 == next.channel_id.0 {
+                            Some(current_call_lock.clone())
                         } else {
                             None
                         }
-                    };
+                    });
                     Some((guild_music_data.guild_id, next, track_pair, current_call))
                 } else {
                     None
@@ -119,7 +125,7 @@ impl GuildMusic {
                 None
             }
         } {
-            let guild_music_data_lock = self.guild_music_data.clone();
+            let play_guild_music_data_lock = self.guild_music_data.clone();
             tokio::spawn(async move {
                 match {
                     if track_pair_option.is_some() {
@@ -128,7 +134,7 @@ impl GuildMusic {
                         get_ytdl_track(next.url).await
                     }
                 } {
-                    Some((track, handle)) => {
+                    Some((track, track_handle)) => {
                         match {
                             if current_call_option.is_some() {
                                 current_call_option
@@ -138,15 +144,16 @@ impl GuildMusic {
                         } {
                             Some(call_lock) => {
                                 {
-                                    guild_music_data_lock.lock().now_playing = Some(handle);
+                                    play_guild_music_data_lock.lock().now_playing = Some(NowPlaying { uuid: next.uuid, track_handle });
                                 }
+                                let elapsed = Instant::now();
                                 let mut call = call_lock.lock().await;
-                                debug!("Acquired call lock");
+                                debug!("Spent {}ms waiting for call lock", elapsed.elapsed().as_millis());
                                 call.play(track);
                                 call.remove_all_global_events();
                                 call.add_global_event(
                                     Event::Track(TrackEvent::End),
-                                    TrackEventListener { guild_id },
+                                    TrackEventListener { guild_id, music_uuid: next.uuid }
                                 );
                             }
                             None => {
@@ -160,25 +167,52 @@ impl GuildMusic {
                 }
             });
         };
+        let music_to_preload = guild_music_data.queue.get(0).map(|music_request| {
+            (music_request.uuid, music_request.url.clone())
+        });
+        if let Some((uuid, _url)) = &music_to_preload {
+            guild_music_data.preloaded = Some(LoadedMusic { uuid: *uuid, track_pair: None });
+        };
+        if let Some((uuid, url)) = music_to_preload {
+            let preload_guild_music_data_lock = self.guild_music_data.clone();
+            tokio::spawn(async move {
+                debug!("Preloading for uuid {} and url {}", uuid, url);
+                let time_elapsed = Instant::now();
+                if let Some(track_pair) = get_ytdl_track(url).await {
+                    debug!("Finished preloading for uuid {} in {}ms", uuid, time_elapsed.elapsed().as_millis());
+                    if let Some(ref mut preloaded) = preload_guild_music_data_lock.lock().preloaded {
+                        if preloaded.uuid == uuid {
+                            preloaded.track_pair = Some(track_pair);
+                        };
+                    };
+                };
+            });
+        };
     }
 
     pub fn insert_music(&self, url: String, channel_id: ChannelId, requested_by: UserId) {
         {
             let mut guild_music_data = self.guild_music_data.lock();
-            guild_music_data.queue.push(MusicQueueEntry {
+            guild_music_data.queue.push(MusicRequest {
+                uuid: Uuid::new_v4(),
                 url,
                 channel_id,
-                requested_by,
+                _requested_by: requested_by
             });
             debug!("Inserted music into guild {:?}", guild_music_data.guild_id);
         }
         self.tick_guild_music();
     }
 
-    pub fn handle_track_event(&self, _ctx: &EventContext<'_>) {
+    pub fn handle_track_event(&self, _ctx: &EventContext<'_>, music_uuid: Uuid) {
         {
             let mut guild_music_data = self.guild_music_data.lock();
-            guild_music_data.now_playing = None;
+            if let Some(now_playing) = &guild_music_data.now_playing {
+                if now_playing.uuid == music_uuid {
+                    if now_playing.track_handle.stop().is_err() {};
+                    guild_music_data.now_playing = None;
+                };
+            }
         }
         self.tick_guild_music();
     }
@@ -186,7 +220,7 @@ impl GuildMusic {
     pub fn skip(&self) -> GuildMusicResult<()> {
         let guild_music_data = self.guild_music_data.lock();
         if let Some(now_playing) = &guild_music_data.now_playing {
-            if let Err(why) = now_playing.stop() {
+            if let Err(why) = now_playing.track_handle.stop() {
                 Err( DiscordCommandError {
                     kind: super::ErrorKind::InternalError,
                     source: Some(Box::new(why)),
@@ -210,7 +244,7 @@ impl GuildMusicData {
         Self {
             guild_id,
             queue: vec![],
-            preloaded: HashMap::new(),
+            preloaded: None,
             now_playing: None,
             call_pair: None,
         }
@@ -229,13 +263,14 @@ fn queue_is_not_empty(guild_music_data: GuildMusicData) -> bool {
 
 struct TrackEventListener {
     guild_id: GuildId,
+    music_uuid: Uuid
 }
 
 #[async_trait]
 impl VoiceEventHandler for TrackEventListener {
     async fn act(&self, ctx: &EventContext<'_>) -> Option<Event> {
         if let Some(guild_music) = GUILD_MUSIC_HASHMAP.lock().get(&self.guild_id) {
-            guild_music.handle_track_event(ctx);
+            guild_music.handle_track_event(ctx, self.music_uuid);
         };
         None
     }

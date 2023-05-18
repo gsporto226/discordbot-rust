@@ -4,9 +4,9 @@
 extern crate lazy_static;
 
 use std::{env, sync::Arc};
-use groups::{music::MUSIC_GROUP, DiscordCommandError};
+use groups::{DiscordCommandError};
 use log::{info, warn, debug};
-use serenity::{client::{EventHandler, Context, bridge::gateway::GatewayIntents}, async_trait, Client, framework::{StandardFramework, standard::{macros::{group, command, hook}, CommandResult, Command, buckets::RevertBucket}}, model::channel::Message};
+use serenity::{client::{EventHandler, Context}, async_trait, Client, framework::{StandardFramework, standard::{macros::{group, command, hook}, CommandResult, Command, buckets::RevertBucket}}, model::channel::Message, prelude::GatewayIntents};
 
 mod constants;
 mod structures;
@@ -14,7 +14,8 @@ mod groups;
 mod utils;
 pub use constants::*;
 use songbird::Songbird;
-use utils::handle_message_result;
+
+use crate::{groups::music::MUSIC_GROUP, utils::reply_with_result};
 
 lazy_static! {
     static ref SONGBIRD: Arc<Songbird> = Songbird::serenity();
@@ -26,18 +27,18 @@ struct Handler;
 impl EventHandler for Handler {}
 
 #[hook]
-async fn before(_context: &Context, msg: &Message, command_name: &str) -> bool {
-    debug!("Got command {} by user {}", command_name, msg.author.name);
+async fn before(_context: &Context, message: &Message, command_name: &str) -> bool {
+    debug!("Got command {} by user {}", command_name, message.author.name);
     true
 }
 
 #[hook]
-async fn after(context: &Context, msg: &Message, command_name: &str, command_result: CommandResult) {
+async fn after(context: &Context, message: &Message, command_name: &str, command_result: CommandResult) {
     if let Err(err) = command_result {
         match err.downcast::<DiscordCommandError>() {
             Ok(error) => {
-                    info!("Error is {}", error);
-                    return handle_message_result(msg.reply(context, format!("{}", error)).await);
+                info!("Error is {}", error);
+                reply_with_result(context, message, format!("{error}"), false).await;
             },
             Err(why) => {
                 warn!("Returned error from command '{}' is not DiscordCommandError: {}", command_name, why);
@@ -48,7 +49,6 @@ async fn after(context: &Context, msg: &Message, command_name: &str, command_res
 
 #[tokio::main]
 async fn main() {
-    setup_logging();
     info!("CLIENT STARTING ==============");
     let token = env::var(TOKEN_ENVIRONMENT_VARIABLE).expect("Expected BOT_RUST_TOKEN to be set as a environment variable");
     let intents = GatewayIntents::all();
@@ -60,8 +60,7 @@ async fn main() {
         .before(before)
         .after(after)
         .group(&MUSIC_GROUP);
-    let mut client = Client::builder(&token)
-        .intents(intents)
+    let mut client = Client::builder(&token, intents)
         .event_handler(Handler)
         .framework(framework)
         .voice_manager_arc(SONGBIRD.clone())
@@ -101,7 +100,7 @@ fn setup_logging() {
             );
         },
         Err(error) => {
-            eprintln!("Failed to initialize file logger with error: {}", error);
+            eprintln!("Failed to initialize file logger with error: {error}");
         }
     }
     match config_builder.build(log4rs::config::Root::builder()
@@ -111,9 +110,9 @@ fn setup_logging() {
         ) {
         Ok(config) => {
             if let Err(error) = log4rs::init_config(config) {
-                eprintln!("Failed to initialize logger with error: {}", error);
+                eprintln!("Failed to initialize logger with error: {error}");
             }
         },
-        Err(error) => eprintln!("Failed to build logger configuration with error: {}", error),
+        Err(error) => eprintln!("Failed to build logger configuration with error: {error}"),
     }
 }

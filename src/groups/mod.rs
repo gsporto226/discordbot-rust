@@ -10,10 +10,11 @@ pub enum ErrorKind {
     NotInVoiceChannel,
     InternalError,
     VoiceNotEnabled,
-    MustProvideURL,
+    MustProvideSomeArguments(u64),
     MusicDataNotInitialized,
     MessageNotInGuildChannel,
-    NoSongCurrentlyPlaying
+    NoSongCurrentlyPlaying,
+    QueueIsEmpty
 }
 
 pub type GuildMusicResult<T> = Result<T, DiscordCommandError>;
